@@ -8,6 +8,17 @@
  * If it is the first timeout since the events were received (evc>0) move omxplayer overlay to the current xwindow position
  *
  * gcc -Wall xomxplayer.c -o xomxplayer -lX11
+ * ChangeLog:
+ *    21-01-2017: Added scale factor based on the size of the frame buffer.
+ *                Set XOMX_FB_DEV to the frame buffer device to enable. This is required if using the framebuffer at resolutions other then 1920x1080,
+ *                e.g. by using fbset -g 1280 720 1280 720 32. Why would you want this? If watching e.g. youtube, the PI 3 will happily decode h264 at 720p in chromium;
+ *                however, it can't scale to full screen - too many pixels. By setting fb to a lower resolution, you can get the gpu to do the scaling to full screen.
+ *                (another option is to use the v4 drm driver for the pi, but at the present time this causes too many problems). The scale factor variables are required
+ *                at lower fb resolutions because the fb is just an omx overlay; the hdmi is still 1080p but the gpu is scaling the fb up; omxplayer still outputs 1080p.
+ *                So a scale factor is required here between the fb resolution (which X uses) and the hdmi resolution that OMXplayer uses.
+ *                ASSUMPTIONS: hdmi output is 1920x1080, and fbset has been used BEFORE starting omxplayer
+ *                             - no attempt is made to recalibrate if fbset is used after starting xomxplayer!
+ *                
  */
 
 #include <stdio.h>
@@ -21,12 +32,21 @@
 #include <X11/keysym.h>
 
 #define LENGTH(X) (sizeof X / sizeof X[0])
+#define XOMX_FB_DEV "/dev/fb0"
 #define DEBUG
+
+/* For framebuffer info */
+#ifdef XOMX_FB_DEV
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
+#endif
+/* End of framebuffer info */
 
 typedef struct {
    KeySym keysym;
    const char **v;
-} Key;
+} XOMX_key;
 
 static Display *dis;
 static Window win;
@@ -44,8 +64,10 @@ static char className[] = "xomxplayer";
 static const char omxplayerFont[]="/usr/share/fonts/TTF/Vera.ttf";
 static const char omxplayerItFont[]="/usr/share/fonts/TTF/VeraIt.ttf";
 
-/* Commands to run omxplayer, quit omxplayer and resize / reposition the window. These must be present */
-static const char *omxplayer[]={ "omxplayer.bin", "--font", omxplayerFont, "--italic-font", omxplayerItFont, "--no-keys", "--dbus_name", dbusParam, "--layer", pid, "--win", winParam, "--aspect-mode", "Letterbox", videoFile, NULL };
+/* Commands to run omxplayer, quit omxplayer and resize / reposition the window. These must be present
+ * opengl kms driver requires --no-osd and remove "--sid", "1" and font args
+ */
+static const char *omxplayer[]={ "omxplayer.bin", "--font", omxplayerFont, "--italic-font", omxplayerItFont, "--sid", "1", "--no-keys", "--dbus_name", dbusParam, "--layer", pid, "--win", winParam, "--aspect-mode", "Letterbox", videoFile, NULL };
 static const char *quit_player[]={ "dbus-send", "--type=method_call", "--session", destParam, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Quit", NULL };
 static const char *resize_player[]={ "dbus-send", "--type=method_call", "--session", destParam, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player.VideoPos", "objpath:/not/used", resizeParam, NULL };
 static const char *hide_video[]={ "dbus-send", "--type=method_call", "--session", destParam, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player.Action", "int32:28", NULL };
@@ -65,7 +87,7 @@ static const char *toggle_subtitle[]={ "dbus-send", "--type=method_call", "--ses
 /* See /usr/include/X11/keysymdef.h for keycodes */
 static KeySym quitKey=XK_q;
 static KeySym fullScreenKey=XK_f;
-static Key keys[]= {
+static XOMX_key keys[]= {
    { XK_p,         pause_player },
    { XK_s,         stop_player },
    { XK_Left,      seek_back_small },
@@ -100,19 +122,19 @@ static pid_t spawn(const char **arg) {
    return chld_pid;
 }
 
-static void xhints(void) {
+static void xhints(float sx, float sy) {
    XClassHint class = {className, className};
    XWMHints wm = {.flags = InputHint, .input = 1};
    XSizeHints *sizeh = NULL;
 
    sizeh = XAllocSizeHints();
    sizeh->flags = PSize | PMinSize | PMaxSize ;
-   sizeh->height = 576;
-   sizeh->width = 1024;
-   sizeh->min_width=320;
-   sizeh->min_height=240;
-   sizeh->max_width=1920;
-   sizeh->max_height=1080;
+   sizeh->height = (int)(576*sx);
+   sizeh->width = (int)(1024*sy);
+   sizeh->min_width=(int)(320*sx);
+   sizeh->min_height=(int)(240*sy);
+   sizeh->max_width=(int)(1920*sx);
+   sizeh->max_height=(int)(1080*sy);
 
    XSetWMProperties(dis, win, NULL, NULL, NULL, 0, sizeh, &wm, &class);
    XFree(sizeh);
@@ -160,7 +182,7 @@ static int keypress(XEvent *e) {
    return 1;   /* Don't quit player */
 }
 
-static int init(char *file) {
+static int initX(char *file, float sx, float sy) {
    strncpy(videoFile, file, 4095);
    snprintf(pid,15,"%i",getpid());
    strncpy(dbusParam, "org.mpris.MediaPlayer2.omxplayer", 96);
@@ -169,10 +191,10 @@ static int init(char *file) {
    strncat(destParam, dbusParam, 128);
 
    dis=XOpenDisplay(NULL);
-   win=XCreateSimpleWindow(dis, DefaultRootWindow(dis), 1, 1, 1024, 576, 0, BlackPixel (dis, 0), BlackPixel(dis, 0));
+   win=XCreateSimpleWindow(dis, DefaultRootWindow(dis), 1, 1, (int)(1024*sx), (int)(576*sy), 0, BlackPixel (dis, 0), BlackPixel(dis, 0));
    XSetStandardProperties(dis, win, videoFile, videoFile, None, NULL, 0, NULL);
    XSelectInput(dis, win, KeyPressMask | StructureNotifyMask | VisibilityChangeMask);
-   xhints();
+   xhints(sx, sy);
    wmDeleteMessage = XInternAtom(dis, "WM_DELETE_WINDOW", False);
    XSetWMProtocols(dis, win, &wmDeleteMessage, 1); 
    XMapWindow(dis, win);
@@ -180,6 +202,28 @@ static int init(char *file) {
 
    return ConnectionNumber(dis);
 }
+
+#ifdef XOMX_FB_DEV
+static int setScale(float *sx, float *sy) {
+   int fb_fd = 0;
+   struct fb_var_screeninfo fb_info;
+
+   fb_fd = open(XOMX_FB_DEV, O_RDONLY);
+   if (fb_fd == -1) {
+      fprintf(stderr, "setScale: Error opening %s; not setting scale factor.\n", XOMX_FB_DEV);
+      return 1;
+   }
+   if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &fb_info)) {
+      printf("setScale: Error reading screen info; not setting scale factor.\n");
+      close(fb_fd);
+      return 1;
+   }
+   *sx=(float)(fb_info.xres)/1920;
+   *sy=(float)(fb_info.yres)/1080;
+   close(fb_fd);
+   return 0;
+}
+#endif
 
 int main(int argc, char *argv[]) {
    int x11_fd;
@@ -193,13 +237,19 @@ int main(int argc, char *argv[]) {
    pid_t chld_pid;
    int chld_status;
    int omxplayerRunning=2;
+   float sx=1.0;
+   float sy=1.0;
 
    if (argc!=2) {
       printf("Usage: %s <video file>\n", argv[0]);
       return 1;
    }
+#ifdef XOMX_FB_DEV
+   setScale(&sx, &sy);
+#endif
+   printf("Scale factor=(%f,%f)\n",sx, sy);
 
-   x11_fd=init(argv[1]);
+   x11_fd=initX(argv[1], sx, sy);
 
    while(omxplayerRunning > 0) {
       FD_ZERO(&in_fds);
@@ -207,7 +257,6 @@ int main(int argc, char *argv[]) {
 
       tv.tv_usec = 500000;
       tv.tv_sec = 0;
-
       
       switch (select(x11_fd+1, &in_fds, 0, 0, &tv)) {
       case 0: /* Timed out waiting for xevents */
@@ -261,10 +310,10 @@ int main(int argc, char *argv[]) {
          break;
          case ConfigureNotify:
             if (ev.xconfigure.x>=0 && ev.xconfigure.y>=0) {
-               ww=ev.xconfigure.width;
-               wh=ev.xconfigure.height;
-               wx=ev.xconfigure.x;
-               wy=ev.xconfigure.y;
+               ww=ev.xconfigure.width/sx;
+               wh=ev.xconfigure.height/sy;
+               wx=ev.xconfigure.x/sx;
+               wy=ev.xconfigure.y/sy;
                evc++;
             }
          break;
