@@ -18,8 +18,14 @@
  *                So a scale factor is required here between the fb resolution (which X uses) and the hdmi resolution that OMXplayer uses.
  *                ASSUMPTIONS: hdmi output is 1920x1080, and fbset has been used BEFORE starting omxplayer
  *                             - no attempt is made to recalibrate if fbset is used after starting xomxplayer!
- *                
+ *    09-09-2018: Corrected bug: this app was supposed to terminate if omxplayer ended, e.g. was killed. However, omxplayerRunning was set after checking WIFEXITED(), and
+ *                so didn't trigger if omxplayer was terminated by a signal.
+ *                If video is searched forwards past then end of the file, omxplayer no longer responds to dbus control
+ *                Wait for omxplayer to finish at the end, and if it doesn't return within 3 seconds send SIGTERM, then SIGKILL.
  */
+
+// TODO: only one dbus child process should be allowed at a time, and it should be checked that this has finished before quit.
+//       present code assumes all dbus command children have finished at exit.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,6 +245,7 @@ int main(int argc, char *argv[]) {
    int omxplayerRunning=2;
    float sx=1.0;
    float sy=1.0;
+   int i;
 
    if (argc!=2) {
       printf("Usage: %s <video file>\n", argv[0]);
@@ -278,12 +285,13 @@ int main(int argc, char *argv[]) {
          evc=0;   /* Reset resize event counter */
          chld_pid=waitpid(-1, &chld_status, WNOHANG);
          if (chld_pid>0) {
-            if (WIFEXITED(chld_status)) {
-            #ifdef DEBUG
+         #ifdef DEBUG
+            if (WIFEXITED(chld_status))
                fprintf(stderr, "Child with pid %i finished with exit code %i.\n",chld_pid, WEXITSTATUS(chld_status));
-            #endif
-               if (omxplayerRunning==1 && chld_pid==omxplayer_pid)
-                  omxplayerRunning=0;  /* omxplayer finished */
+         #endif
+            if (omxplayerRunning==1 && chld_pid==omxplayer_pid) {
+               omxplayerRunning=0;  /* omxplayer finished */
+               omxplayer_pid=0;
             }
          }
       break;
@@ -326,6 +334,35 @@ int main(int argc, char *argv[]) {
          }
       }
    }
+
+   if (omxplayer_pid != 0) {
+      i=0;
+      while (i<3) {  /* Wait for omxplayer to finish */
+         chld_pid=waitpid(omxplayer_pid, &chld_status, WNOHANG);
+         if (chld_pid > 0)
+            break;
+         else
+            sleep(1);
+         i++;
+      }
+
+      if (chld_pid != omxplayer_pid) { /* Looks like omxplayer is not responding to dbus control, send TERM signal */
+         fprintf(stderr, "ERROR: xomxplayer: omxplayer not responding, sending SIGTERM.\n");
+         kill(omxplayer_pid, SIGTERM);
+         sleep(1);
+         chld_pid=waitpid(omxplayer_pid, &chld_status, WNOHANG);
+         if (chld_pid != omxplayer_pid) {/* SIGTERM ignored, try SIGKILL */
+            fprintf(stderr, "ERROR: xomxplayer: SIGTERM ignored, sending SIGKILL.\n");
+            kill(omxplayer_pid, SIGKILL);
+            sleep(1);
+            chld_pid=waitpid(omxplayer_pid, &chld_status, WNOHANG);
+            if (chld_pid != omxplayer_pid)
+               fprintf(stderr, "ERROR: xomxplayer: Can't stop omxplayer!\n");
+         }
+      }
+   }
+   else
+      fprintf(stderr, "ERROR: xomxplayer stopped unexpectedly.\n");
 
    XDestroyWindow(dis,win);
    XCloseDisplay(dis);
